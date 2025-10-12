@@ -31,6 +31,11 @@ def get_lr(current_step, total_steps, lr):
 
 
 def logits_to_probs(logits, labels):
+    """
+    将 logits 转换为概率分布
+    对于一个批次的序列数据，计算模型在每个时间步对“真实下一个 token”的预测所对应的对数概率，
+    并返回一个与序列形状相同的张量
+    """
     # logits shape: (batch_size, seq_len, vocab_size)
     # labels shape: (batch_size, seq_len)
     # probs shape: (batch_size, seq_len)
@@ -136,6 +141,7 @@ def init_model(lm_config):
     moe_path = '_moe' if lm_config.use_moe else ''
     ckp = f'{args.save_dir}/full_sft_{lm_config.hidden_size}{moe_path}.pth'
     state_dict = torch.load(ckp, map_location=args.device)
+    # 加载完整模型的状态字典
     model.load_state_dict(state_dict, strict=False)
     # 初始化参考模型
     ref_model = MiniMindForCausalLM(lm_config)

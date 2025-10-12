@@ -164,7 +164,6 @@ if __name__ == "__main__":
     args.wandb_run_name = f"MiniMind-Lora-SFT-Epoch-{args.epochs}-BatchSize-{args.batch_size}-LearningRate-{args.learning_rate}"
     if args.use_wandb and (not ddp or ddp_local_rank == 0):
         import wandb
-
         wandb.init(project=args.wandb_project, name=args.wandb_run_name)
     else:
         wandb = None
@@ -181,6 +180,7 @@ if __name__ == "__main__":
 
     for name, param in model.named_parameters():
         if 'lora' not in name:
+            # 冻结非 LoRA 参数
             param.requires_grad = False
     lora_params = []
     for name, param in model.named_parameters():

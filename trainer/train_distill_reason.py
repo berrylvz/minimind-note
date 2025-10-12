@@ -52,6 +52,7 @@ def train_epoch(epoch, wandb):
                 res.logits.view(-1, res.logits.size(-1)),
                 Y.view(-1)
             ).view(Y.size())
+            # 创建一个布尔掩码 sp_ids，标记出标签 Y 中所有对应于“思考”和“答案”开始/结束标记的位置
             sp_ids = torch.isin(Y.view(-1),
                                 torch.tensor(start_of_think_ids + end_of_think_ids
                                              + start_of_answer_ids + end_of_answer_ids
@@ -59,7 +60,7 @@ def train_epoch(epoch, wandb):
             # 在 sp_ids 对应的位置增加额外的惩罚
             loss_mask = loss_mask.view(-1)
             loss_mask_sum = loss_mask.sum()
-            loss_mask[sp_ids] = 10
+            loss_mask[sp_ids] = 10 # 惩罚系数
             loss_mask = loss_mask.view(Y.size())
             loss = (loss * loss_mask).sum() / loss_mask_sum
             loss += res.aux_loss
@@ -185,7 +186,6 @@ if __name__ == "__main__":
 
     if args.use_wandb and (not ddp or ddp_local_rank == 0):
         import wandb
-
         wandb.init(project=args.wandb_project, name=args.wandb_run_name)
     else:
         wandb = None
