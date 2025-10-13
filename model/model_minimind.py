@@ -2,40 +2,49 @@
 #                                             MiniMind Config
 # 📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘
 
+"""
+用途: 定义 MiniMind 模型的配置类 (MiniMindConfig)
+主要功能:
+1. 继承自 HuggingFace 的 PretrainedConfig，用于保存和传递模型的超参数
+2. 包含基础 Transformer 参数 (如 hidden_size, num_layers, vocab_size 等)
+3. 包含可选的 Mixture-of-Experts (MoE) 相关配置
+"""
+
 from transformers import PretrainedConfig
 
 
 class MiniMindConfig(PretrainedConfig):
+    # 模型类型，用于标识模型类别
     model_type = "minimind"
 
     def __init__(
             self,
             dropout: float = 0.0,
-            bos_token_id: int = 1,
-            eos_token_id: int = 2,
-            hidden_act: str = 'silu',
-            hidden_size: int = 512,
-            intermediate_size: int = None,
-            max_position_embeddings: int = 32768,
-            num_attention_heads: int = 8,
+            bos_token_id: int = 1, # begin of sentence token id
+            eos_token_id: int = 2, # end of sentence token id
+            hidden_act: str = 'silu', # hidden activation function
+            hidden_size: int = 512, # dimension of the hidden states
+            intermediate_size: int = None, # dimension of the intermediate layer in FFN
+            max_position_embeddings: int = 32768, # maximum sequence length
+            num_attention_heads: int = 8, # num of attention heads
             num_hidden_layers: int = 8,
-            num_key_value_heads: int = 2,
-            vocab_size: int = 6400,
-            rms_norm_eps: float = 1e-05,
-            rope_theta: int = 1000000.0,
-            flash_attn: bool = True,
+            num_key_value_heads: int = 2, # num of KV cache heads
+            vocab_size: int = 6400, # vocabulary size
+            rms_norm_eps: float = 1e-05, # epsilon for RMSNorm
+            rope_theta: int = 1000000.0, # theta for rotary position embeddings
+            flash_attn: bool = True, # whether to use flash attention
             ####################################################
             # Here are the specific configurations of MOE
             # When use_moe is false, the following is invalid
             ####################################################
-            use_moe: bool = False,
-            num_experts_per_tok: int = 2,
-            n_routed_experts: int = 4,
-            n_shared_experts: int = 1,
-            scoring_func: str = 'softmax',
-            aux_loss_alpha: float = 0.1,
-            seq_aux: bool = True,
-            norm_topk_prob: bool = True,
+            use_moe: bool = False, # whether to use Mixture-of-Experts
+            num_experts_per_tok: int = 2, # num of experts per token
+            n_routed_experts: int = 4, # num of routed experts
+            n_shared_experts: int = 1, # num of shared experts
+            scoring_func: str = 'softmax', # scoring function for MoE
+            aux_loss_alpha: float = 0.1, # alpha for auxiliary loss
+            seq_aux: bool = True, # whether to use sequence auxiliary loss
+            norm_topk_prob: bool = True, # whether to normalize top-k probabilities
             **kwargs
     ):
         super().__init__(**kwargs)
@@ -70,6 +79,19 @@ class MiniMindConfig(PretrainedConfig):
 # 📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘
 #                                             MiniMind Model
 # 📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘
+
+"""
+文件用途：实现 MiniMind 模型主体（Transformer + 可选 MoE）与因果语言建模头
+主要模块：
+- RMSNorm：RMS 归一化
+- RoPE：旋转位置编码的预计算与应用
+- Attention：多头自注意力（支持 FlashAttention 与 KV Cache）
+- FeedForward：前馈网络（SwiGLU 风格）
+- MoEGate/MOEFeedForward：门控专家路由与推理/训练
+- MiniMindBlock：单层 Transformer（Pre-Norm + 残差）
+- MiniMindModel：堆叠多层 + 位置编码缓存 + 汇总辅助损失
+- MiniMindForCausalLM：接入 HuggingFace 框架，输出 CausalLMOutputWithPast
+"""
 
 import math
 import torch
@@ -180,9 +202,13 @@ class Attention(nn.Module):
         # num_attention_heads / num_key_value_heads
         self.n_rep = self.n_local_heads // self.n_local_kv_heads
         self.head_dim = args.hidden_size // args.num_attention_heads
+        # embeded dimension (=hidden size) -> num_attention_heads * head_dim (=hidden_size)
         self.q_proj = nn.Linear(args.hidden_size, args.num_attention_heads * self.head_dim, bias=False)
+        # embeded dimension (=hidden size) -> num_key_value_heads * head_dim
         self.k_proj = nn.Linear(args.hidden_size, self.num_key_value_heads * self.head_dim, bias=False)
+        # embeded dimension (=hidden size) -> num_key_value_heads * head_dim
         self.v_proj = nn.Linear(args.hidden_size, self.num_key_value_heads * self.head_dim, bias=False)
+        # hidden_size (=num_attention_heads * head_dim) -> hidden_size
         self.o_proj = nn.Linear(args.num_attention_heads * self.head_dim, args.hidden_size, bias=False)
         self.attn_dropout = nn.Dropout(args.dropout)
         self.resid_dropout = nn.Dropout(args.dropout)
@@ -201,7 +227,7 @@ class Attention(nn.Module):
         Foward function of attention
 
         Args:
-            x (torch.Tensor): The input tensor with shape of (batch_size, sequence_length, hidden_size).
+            x (torch.Tensor): The input tensor with shape of (batch_size, sequence_length, embed_dim).
             position_embeddings (Tuple[torch.Tensor, torch.Tensor]): The cosine and sine part of the precomputed frequency tensor.
             past_key_value (Optional[Tuple[torch.Tensor, torch.Tensor]], optional): The past key and value tensors. Defaults to None. Used to acclerate inference.
             use_cache (bool, optional): Whether to use cache. Defaults to False.
@@ -210,15 +236,15 @@ class Attention(nn.Module):
         Returns:
             torch.Tensor: The output tensor.
         """
-        # batch size, sequence length, hidden size
+        # batch size, sequence length, embeded dimension
         bsz, seq_len, _ = x.shape
         # project the input tensor to query, key, and value tensors
-        # shape of xq: batch_size, seq_len, num_heads * head_dim
+        # shape of xq: batch_size, seq_len, num_attention_heads * head_dim (=hidden_size)
         # shape of xk: batch_size, seq_len, num_key_value_heads * head_dim
         # shape of xv: batch_size, seq_len, num_key_value_heads * head_dim
         xq, xk, xv = self.q_proj(x), self.k_proj(x), self.v_proj(x)
         # reshape
-        # shape of xq: batch_size, seq_len, num_heads, head_dim
+        # shape of xq: batch_size, seq_len, num_attention_heads, head_dim
         # shape of xk: batch_size, seq_len, num_key_value_heads, head_dim
         # shape of xv: batch_size, seq_len, num_key_value_heads, head_dim
         xq = xq.view(bsz, seq_len, self.n_local_heads, self.head_dim)
@@ -229,7 +255,7 @@ class Attention(nn.Module):
         # TODO: shape of cos, sin
         cos, sin = position_embeddings
         # apply rotary positional embeddings to query and key tensors
-        # shape of xq: batch_size, seq_len, num_heads, head_dim
+        # shape of xq: batch_size, seq_len, num_attention_heads, head_dim
         # shape of xk: batch_size, seq_len, num_key_value_heads, head_dim
         xq, xk = apply_rotary_pos_emb(xq, xk, cos[:seq_len], sin[:seq_len])
 
@@ -242,12 +268,12 @@ class Attention(nn.Module):
         # repeat the key and value tensors to match the number of heads
         # transpose the tensor to match the shape required by flash attention
         xq, xk, xv = (
-            # shape of xq: batch_size, num_heads, seq_len, head_dim
+            # shape of xq: batch_size, num_attention_heads, seq_len, head_dim
             xq.transpose(1, 2),
-            # n_rep = num_key_value_heads // num_heads
-            # shape of xk: batch_size, num_heads, seq_len, head_dim
+            # n_rep = num_attention_heads // num_key_value_heads
+            # shape of xk: batch_size, num_attention_heads, seq_len, head_dim
             repeat_kv(xk, self.n_rep).transpose(1, 2),
-            # shape of xv: batch_size, num_heads, seq_len, head_dim
+            # shape of xv: batch_size, num_attention_heads, seq_len, head_dim
             repeat_kv(xv, self.n_rep).transpose(1, 2)
         )
 
@@ -258,11 +284,12 @@ class Attention(nn.Module):
             if attention_mask is not None:
                 # original shape of attention_mask: batch_size, sequence_length
                 # expand the attention_mask to match the shape required by flash attention
-                # shape of attn_mask: batch_size, num_heads, seq_len, seq_len
+                # shape of attn_mask: batch_size, num_attention_heads, seq_len, seq_len
                 attn_mask = attention_mask.view(bsz, 1, 1, -1).expand(bsz, self.n_local_heads, seq_len, -1)
                 attn_mask = attn_mask.bool() if attention_mask is not None else None
             # use scaled_dot_product_attention to compute the attention output
-            # shape of output: batch_size, num_heads, seq_len, head_dim, same as xv
+            # shape of output: batch_size, num_attention_heads, seq_len, head_dim, same as xv
+            # TODO: how to use attn_mask in flash attention
             output = F.scaled_dot_product_attention(xq, xk, xv, attn_mask=attn_mask, dropout_p=dropout_p, is_causal=True)
         else:
             # TODO
@@ -282,8 +309,8 @@ class Attention(nn.Module):
             output = scores @ xv
         
         # reshape to match the shape required by the model
-        # original shape of output: batch_size, num_heads, seq_len, head_dim
-        # shape of output: batch_size, seq_len, num_heads * head_dim
+        # original shape of output: batch_size, num_attention_heads, seq_len, head_dim
+        # shape of output: batch_size, seq_len, num_attention_heads * head_dim (=hidden_size)
         output = output.transpose(1, 2).reshape(bsz, seq_len, -1)
         # project the output tensor to the hidden size
         # shape of output: batch_size, seq_len, hidden_size
@@ -301,8 +328,8 @@ class FeedForward(nn.Module):
             intermediate_size = int(config.hidden_size * 8 / 3)
             config.intermediate_size = 64 * ((intermediate_size + 64 - 1) // 64)
         self.gate_proj = nn.Linear(config.hidden_size, config.intermediate_size, bias=False)
-        self.down_proj = nn.Linear(config.intermediate_size, config.hidden_size, bias=False)
         self.up_proj = nn.Linear(config.hidden_size, config.intermediate_size, bias=False)
+        self.down_proj = nn.Linear(config.intermediate_size, config.hidden_size, bias=False)
         self.dropout = nn.Dropout(config.dropout)
         # ACT2FN: map activation function name to actual activation function
         # here is SiLU activation function
@@ -497,6 +524,8 @@ class MiniMindBlock(nn.Module):
     def forward(self, hidden_states, position_embeddings, past_key_value=None, use_cache=False, attention_mask=None):
         """
         Perform a forward pass of the MiniMindBlock.
+        input ---> input_layernorm ---> self_attn ---> + ---> post_attention_layernorm ---> mlp (FFN) ---> + ---> output
+              |----------------------------------------^  |------------------------------------------------^
 
         Args:
             hidden_states (torch.Tensor): Input tensor of shape (batch_size, seq_len, hidden_size).
@@ -527,6 +556,7 @@ class MiniMindModel(nn.Module):
         super().__init__()
         self.config = config
         self.vocab_size, self.num_hidden_layers = config.vocab_size, config.num_hidden_layers
+        # vocab_size -> embedding_size (=hidden_size)
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
         self.dropout = nn.Dropout(config.dropout)
         # Stack of transformer blocks
@@ -546,6 +576,7 @@ class MiniMindModel(nn.Module):
                 **kwargs):
         """
         Perform a forward pass of the MiniMindModel.
+        input_ids ---> input_embedding ---> dropout ---> (transformer layers) * num_hidden_layers ---> RMSNorm ---> output
 
         Args:
             input_ids (torch.Tensor): Input tensor of shape (batch_size, seq_len).
@@ -582,8 +613,10 @@ class MiniMindModel(nn.Module):
             )
             presents.append(present)
         # RMSNorm
+        # shape of hidden_states: (batch_size, seq_len, hidden_size)
         hidden_states = self.norm(hidden_states)
 
+        # 对于 MoE 模型，计算辅助损失
         aux_loss = sum(
             layer.mlp.aux_loss
             for layer in self.layers
@@ -600,6 +633,7 @@ class MiniMindForCausalLM(PreTrainedModel, GenerationMixin):
         self.config = config or MiniMindConfig()
         super().__init__(self.config)
         self.model = MiniMindModel(self.config)
+        # hidden_size -> vocab_size
         self.lm_head = nn.Linear(self.config.hidden_size, self.config.vocab_size, bias=False)
         self.model.embed_tokens.weight = self.lm_head.weight
         self.OUT = CausalLMOutputWithPast()
@@ -618,12 +652,16 @@ class MiniMindForCausalLM(PreTrainedModel, GenerationMixin):
             use_cache=use_cache,
             **args
         )
+        # 只对某些位置计算logits
+        # 例如，训练时只关心最后几个token的预测，如指令微调只预测回答部分；生成时只关心最后一个token的输出
+        # 如logits_to_keep=1, slice_indices=slice(-1, None)，则只计算最后一个token的logits
+        # 如logits_to_keep=3, slice_indices=slice(-3, None)，则计算最后3个token的logits
         slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
         # Apply language model head
-        # shape of logits: (batch_size, seq_len, vocab_size)
         logits = self.lm_head(h[:, slice_indices, :])
         self.OUT.__setitem__('last_hidden_state', h)
         self.OUT.__setitem__('logits', logits)
         self.OUT.__setitem__('aux_loss', aux_loss)
         self.OUT.__setitem__('past_key_values', past_kvs)
         return self.OUT
+
