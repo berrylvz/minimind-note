@@ -135,12 +135,13 @@ def main():
         messages = messages[-args.history_cnt:] if args.history_cnt else []
         messages.append({"role": "user", "content": prompt})
 
+        # 格式化输入prompt，根据模型模式选择不同的模板
         new_prompt = tokenizer.apply_chat_template(
             messages,
             tokenize=False,
             add_generation_prompt=True
         ) if args.model_mode != 0 else (tokenizer.bos_token + prompt)
-
+        # 对格式化后的prompt进行tokenize
         inputs = tokenizer(
             new_prompt,
             return_tensors="pt",
@@ -148,9 +149,16 @@ def main():
         ).to(args.device)
 
         print('🤖️: ', end='')
+        # 调用模型生成回复
+        # 使用streamer实时显示生成的token
+        # generate的工作流程：
+        # 1. 模型根据输入的token序列，生成下一个token的概率分布
+        # 2. 根据概率分布，采样出下一个token
+        # 3. 将采样出的token添加到输入序列中
+        # 4. 重复步骤1-3，直到生成指定数量的token或遇到结束符
         generated_ids = model.generate(
             inputs["input_ids"],
-            max_new_tokens=args.max_seq_len,
+            max_new_tokens=args.max_seq_len, # 最大输出长度
             num_return_sequences=1,
             do_sample=True,
             attention_mask=inputs["attention_mask"],
@@ -160,7 +168,7 @@ def main():
             top_p=args.top_p,
             temperature=args.temperature
         )
-
+        # 解码生成的token为文本
         response = tokenizer.decode(generated_ids[0][inputs["input_ids"].shape[1]:], skip_special_tokens=True)
         messages.append({"role": "assistant", "content": response})
         print('\n\n')

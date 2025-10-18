@@ -126,16 +126,33 @@ class RMSNorm(torch.nn.Module):
     def forward(self, x):
         return self.weight * self._norm(x.float()).type_as(x)
 
-# TODO
+
 def precompute_freqs_cis(dim: int, end: int = int(32 * 1024), theta: float = 1e6):
+    """
+    Precompute the cosine and sine parts of the rotary positional embeddings.
+
+    Args:
+        dim (int): The dimension of the embeddings. hidden_size // num_attention_heads
+        end (int, optional): The end index for precomputation. Defaults to int(32 * 1024).
+            序列的最大长度，默认32k，这意味着支持最长32K token的上下文，这是RoPE能够外推长文本的关键
+        theta (float, optional): The theta value for frequency calculation. Defaults to 1e6.
+
+    Returns:
+        Tuple[torch.Tensor, torch.Tensor]: The cosine and sine parts of the rotary positional embeddings. Shape: (end, dim)
+    """
+    # freqs = 1 / (theta ** (2i / dim)) for i in range(0, dim/2)
     freqs = 1.0 / (theta ** (torch.arange(0, dim, 2)[: (dim // 2)].float() / dim))
     t = torch.arange(end, device=freqs.device)
+    # freqs = (t * freqs) for t in range(end)
+    # freqs[m, i] = m / (theta ** (2i / dim))
+    # shape: (end, dim // 2)
     freqs = torch.outer(t, freqs).float()
     freqs_cos = torch.cat([torch.cos(freqs), torch.cos(freqs)], dim=-1)
     freqs_sin = torch.cat([torch.sin(freqs), torch.sin(freqs)], dim=-1)
+    # shape: (end, dim)
     return freqs_cos, freqs_sin
 
-# TODO
+
 def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
     """
     Apply rotary positional embeddings to the query and key tensors.
@@ -145,10 +162,10 @@ def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
     + keep the relative position
 
     Args:
-        q (torch.Tensor): The query tensor.
-        k (torch.Tensor): The key tensor.
-        cos (torch.Tensor): The cosine part of the precomputed frequency tensor.
-        sin (torch.Tensor): The sine part of the precomputed frequency tensor.
+        q (torch.Tensor): The query tensor. batch_size, seq_len, num_attention_heads, head_dim
+        k (torch.Tensor): The key tensor. batch_size, seq_len, num_attention_heads, head_dim
+        cos (torch.Tensor): The cosine part of the precomputed frequency tensor. Shape: (seq_len, dim)
+        sin (torch.Tensor): The sine part of the precomputed frequency tensor. Shape: (seq_len, dim)
         position_ids (torch.Tensor, optional): The position ids tensor. Defaults to None.
         unsqueeze_dim (int, optional): The dimension to unsqueeze. Defaults to 1.
 
@@ -157,6 +174,7 @@ def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
     """
     def rotate_half(x):
         # rotate half of the last dimension
+        # eg. x = [1, 2, 3, 4, 5, 6], rotate_half(x) = [-4, -5, -6, 1, 2, 3]
         return torch.cat((-x[..., x.shape[-1] // 2:], x[..., : x.shape[-1] // 2]), dim=-1)
 
     q_embed = (q * cos.unsqueeze(unsqueeze_dim)) + (rotate_half(q) * sin.unsqueeze(unsqueeze_dim))
@@ -252,7 +270,7 @@ class Attention(nn.Module):
         xv = xv.view(bsz, seq_len, self.n_local_kv_heads, self.head_dim)
 
         # decompose the position embeddings to cosine and sine parts
-        # TODO: shape of cos, sin
+        # shape of cos, sin: (end, hidden_dim)
         cos, sin = position_embeddings
         # apply rotary positional embeddings to query and key tensors
         # shape of xq: batch_size, seq_len, num_attention_heads, head_dim
@@ -376,15 +394,23 @@ class MoEGate(nn.Module):
     def __init__(self, config: MiniMindConfig):
         super().__init__()
         self.config = config
+        # top_k: number of experts to be selected for each token
         self.top_k = config.num_experts_per_tok
+        # n_routed_experts: number of experts in the MoE layer
         self.n_routed_experts = config.n_routed_experts
 
+        # scoring_func: the function to compute the match degree between tokens and experts
         self.scoring_func = config.scoring_func
+        # alpha: the weight of the auxiliary loss term
         self.alpha = config.aux_loss_alpha
+        # seq_aux: whether to use sequence auxiliary loss term
         self.seq_aux = config.seq_aux
 
+        # norm_topk_prob: whether to normalize the top-k probabilities
         self.norm_topk_prob = config.norm_topk_prob
+        # gating_dim: the dimension of the gating layer
         self.gating_dim = config.hidden_size
+        # (n_routed_experts, hidden_size)
         self.weight = nn.Parameter(torch.empty((self.n_routed_experts, self.gating_dim)))
         self.reset_parameters()
 
@@ -402,8 +428,8 @@ class MoEGate(nn.Module):
 
         Returns:
             tuple: A tuple containing the following elements:
-                - topk_idx (torch.Tensor): Indices of the top-k experts for each token, of shape (batch_size, seq_len, top_k).
-                - topk_weight (torch.Tensor): Weights of the top-k experts for each token, of shape (batch_size, seq_len, top_k).
+                - topk_idx (torch.Tensor): Indices of the top-k experts for each token, of shape (batch_size * seq_len, top_k).
+                - topk_weight (torch.Tensor): Weights of the top-k experts for each token, of shape (batch_size * seq_len, top_k).
                 - aux_loss (torch.Tensor): Auxiliary loss term, of shape (1,).
         """
         # hidden_states: batch_size, seq_len, hidden_size
@@ -418,13 +444,15 @@ class MoEGate(nn.Module):
         logits = F.linear(hidden_states, self.weight, None)
         if self.scoring_func == 'softmax':
             # softmax over logits to get scores
+            # batch_size * seq_len, n_routed_experts
             scores = logits.softmax(dim=-1)
         else:
             raise NotImplementedError(f'insupportable scoring function for MoE gating: {self.scoring_func}')
-        # get top-k indices and weights
+        # get top-k indices and weights, (batch_size * seq_len, top_k)
         # topk_weight: probability of id in topk_idx
         # topk_idx: selected expert id of every token
         topk_weight, topk_idx = torch.topk(scores, k=self.top_k, dim=-1, sorted=False)
+        
         if self.top_k > 1 and self.norm_topk_prob:
             # normalize top-k weights, sum to 1
             denominator = topk_weight.sum(dim=-1, keepdim=True) + 1e-20
@@ -434,27 +462,39 @@ class MoEGate(nn.Module):
             # auxiliary loss to balance overload of every expert
             scores_for_aux = scores
             aux_topk = self.top_k
+            # batch_size, seq_len * top_k
             topk_idx_for_aux_loss = topk_idx.view(bsz, -1)
-            if self.seq_aux:
-                # sequence level auxiliary loss
+            if self.seq_aux: # 按batch维度分别计算每个样本内部的expert使用分布
                 # reshape scores_for_aux to (bsz, seq_len, n_routed_experts)
                 scores_for_seq_aux = scores_for_aux.view(bsz, seq_len, -1)
+                # 初始化每个batch的expert统计, batch_size, n_routed_experts
                 ce = torch.zeros(bsz, self.n_routed_experts, device=hidden_states.device)
                 # compute frequency of each expert in topk_idx_for_aux_loss
-                # TODO
-                ce.scatter_add_(1, topk_idx_for_aux_loss,
-                                torch.ones(bsz, seq_len * aux_topk, device=hidden_states.device)).div_(
-                    seq_len * aux_topk / self.n_routed_experts)
+                # scatter_add_根据index将src中对应位置的值累加到ce的index位置
+                ce.scatter_add_(
+                    dim=1, 
+                    index=topk_idx_for_aux_loss, # [bsz, seq_len * top_k]，每个样本所有 token 的 top_k expert 索引
+                    src=torch.ones(bsz, seq_len * aux_topk, device=hidden_states.device) # [bsz, seq_len * top_k]，所有位置计数为1
+                ).div_(seq_len * aux_topk / self.n_routed_experts) # 标准化：理论上每个expert的理想负载是平均的
                 # compute auxiliary loss
-                # TODO
+                # aux_loss越大说明score分布与使用频率越不匹配 (某些expert被打分高且被频繁选中)
                 aux_loss = (ce * scores_for_seq_aux.mean(dim=1)).sum(dim=1).mean() * self.alpha
             else:
-                # batch level auxiliary loss
-                # TODO
-                mask_ce = F.one_hot(topk_idx_for_aux_loss.view(-1), num_classes=self.n_routed_experts)
+                # one-hot编码每个token的top_k expert索引
+                # (bsz * seq_len * top_k, n_routed_experts)
+                mask_ce = F.one_hot(
+                    topk_idx_for_aux_loss.view(-1), 
+                    num_classes=self.n_routed_experts
+                )
+                # 每个expert被使用的频率, (n_routed_experts,)
                 ce = mask_ce.float().mean(0)
+                # 每个token对各expert的平均打分, (n_routed_experts,)
                 Pi = scores_for_aux.mean(0)
+                # 负载比，理想负载为1
                 fi = ce * self.n_routed_experts
+                # Pi: 平均打分，值越大说明router趋向于使用该expert
+                # fi: 实际负载，值越大说明该expert被频繁使用
+                # Pi*fi: 打分高且频率高的 expert 会导致更大的 loss（目标是让负载更均匀）
                 aux_loss = (Pi * fi).sum() * self.alpha
         else:
             aux_loss = 0
@@ -465,13 +505,15 @@ class MOEFeedForward(nn.Module):
     def __init__(self, config: MiniMindConfig):
         super().__init__()
         self.config = config
-        # router expert
+        # routed expert
         self.experts = nn.ModuleList([
             FeedForward(config)
             for _ in range(config.n_routed_experts)
         ])
+
         # gate network
         self.gate = MoEGate(config)
+
         # shared expert
         if config.n_shared_experts > 0:
             self.shared_experts = nn.ModuleList([
@@ -480,38 +522,88 @@ class MOEFeedForward(nn.Module):
             ])
 
     def forward(self, x):
+        """
+        Forward pass of the MOEFeedForward layer.
+
+        Args:
+            x (torch.Tensor): Input tensor of shape (batch_size, seq_len, hidden_size).
+
+        Returns:
+            torch.Tensor: Output tensor of shape (batch_size, seq_len, hidden_size).
+        """
         identity = x
         orig_shape = x.shape
         bsz, seq_len, _ = x.shape
-        # 使用门控机制选择专家
+
+        # 选择top-k专家
+        # topk_idx: selected expert id of every token of shape (batch_size * seq_len, top_k)
+        # topk_weight: probability of id in topk_idx of shape (batch_size * seq_len, top_k)
         topk_idx, topk_weight, aux_loss = self.gate(x)
-        # batch_size * seq_len, hidden_size
+
+        # flatten topk_idx to ((batch_size * seq_len), hidden_size)
         x = x.view(-1, x.shape[-1])
+
         # 为每个专家重复输入，根据topk_idx
-        # (batch_size * seq_len * top_k)
+        # ((batch_size * seq_len) * top_k)
         flat_topk_idx = topk_idx.view(-1)
+
         if self.training:
-            # TODO
+            # 每个token重复top_k次，根据topk_idx选择专家
+            # shape of x: ((batch_size * seq_len) * top_k, hidden_size)
             x = x.repeat_interleave(self.config.num_experts_per_tok, dim=0)
+
+            # 用于收集每个专家处理后的结果
             y = torch.empty_like(x, dtype=torch.float16)
+
+            # 遍历每个专家，让其处理分配给它的token
             for i, expert in enumerate(self.experts):
+                # expert 输出: (num_token_i, hidden_size)
+                # 其中num_token_i = sum(flat_topk_idx == i)
                 y[flat_topk_idx == i] = expert(x[flat_topk_idx == i]).to(y.dtype)  # 确保类型一致
+            # 合并所有专家的输出
+            # input y: ((batch_size * seq_len) * top_k, hidden_size)
+            # y.view(*topk_weight.shape, -1): (batch_size * seq_len, top_k, hidden_size)
+            # topk_weight.unsqueeze(-1): (batch_size * seq_len, top_k, 1)
+            # output y: (batch_size * seq_len, hidden_size)
             y = (y.view(*topk_weight.shape, -1) * topk_weight.unsqueeze(-1)).sum(dim=1)
+            # 恢复原始形状
+            # y: (batch_size, seq_len, hidden_size)
             y = y.view(*orig_shape)
         else:
             y = self.moe_infer(x, flat_topk_idx, topk_weight.view(-1, 1)).view(*orig_shape)
+        # 加上共享专家的输出
         if self.config.n_shared_experts > 0:
             for expert in self.shared_experts:
                 y = y + expert(identity)
+        # 门控产生的辅助损失
         self.aux_loss = aux_loss
         return y
 
     @torch.no_grad()
     def moe_infer(self, x, flat_expert_indices, flat_expert_weights):
+        """
+        推理时，根据专家索引和权重，计算每个token的输出。
+
+        Args:
+            x (torch.Tensor): Input tensor of shape (batch_size * seq_len, hidden_size).
+            flat_expert_indices (torch.Tensor): Expert indices for each token of shape (batch_size * seq_len * top_k).
+            flat_expert_weights (torch.Tensor): Expert weights for each token of shape (batch_size * seq_len * top_k, 1).
+
+        Returns:
+            torch.Tensor: Output tensor of shape (batch_size * seq_len, hidden_size).
+        """
+        # 初始化专家缓存，用于存储每个专家处理后的结果
         expert_cache = torch.zeros_like(x)
+        # 根据专家编号对所有 token 排序 (为了把分配到相同专家的token放在一起)
         idxs = flat_expert_indices.argsort()
+        # 统计每个专家分配到的token数量并累加，方便切分
+        # tokens_per_expert[i] 表示第i个专家前面(由其他专家)累积处理的token数量
+        # shape: ((batch_size * seq_len) * top_k)
         tokens_per_expert = flat_expert_indices.bincount().cpu().numpy().cumsum(0)
+        # 计算按照专家分组排序后的token属于哪些原始token
+        # self.config.num_experts_per_tok = top_k
         token_idxs = idxs // self.config.num_experts_per_tok
+        # 遍历每个专家，将分配到该专家的token送入对应 FFN 计算
         # 当tokens_per_expert = [6, 15, 20, 26]，tokens_per_expert.shape[0]即为专家数量（此时为4）
         # 且token_idxs = [3, 7, 19, 21, 24, 25,  4,  5,  6, 10, 11, 12...] 时
         # 意味token_idxs[:6] -> [3, 7, 19, 21, 24, 25]这6个位置属于专家0处理的token（每个token有可能被多个专家处理，这取决于num_experts_per_tok）
@@ -519,14 +611,26 @@ class MOEFeedForward(nn.Module):
         for i, end_idx in enumerate(tokens_per_expert):
             start_idx = 0 if i == 0 else tokens_per_expert[i - 1]
             if start_idx == end_idx:
-                continue
-            expert = self.experts[i]
-            exp_token_idx = token_idxs[start_idx:end_idx]
-            expert_tokens = x[exp_token_idx]
-            expert_out = expert(expert_tokens).to(expert_cache.dtype)
-            expert_out.mul_(flat_expert_weights[idxs[start_idx:end_idx]])
-            expert_cache.scatter_add_(0, exp_token_idx.view(-1, 1).repeat(1, x.shape[-1]), expert_out)
+                continue # 该专家没有被分配 token
+            # 上述的start_idx ~ end_idx 是专家i需要负责处理的token索引
 
+            # 获取专家FFN模块
+            expert = self.experts[i]
+            # 获取分配给第i个专家的token原始位置索引
+            exp_token_idx = token_idxs[start_idx:end_idx]
+            # 获取专家i负责处理的token输入
+            expert_tokens = x[exp_token_idx]
+            # 执行当前专家对应FFN的前向传播
+            expert_out = expert(expert_tokens).to(expert_cache.dtype)
+            # 用gate权重缩放输出
+            expert_out.mul_(flat_expert_weights[idxs[start_idx:end_idx]])
+            # 累加到输出缓存中，支持一个token被多个专家处理后结果叠加
+            expert_cache.scatter_add_(
+                dim=0, 
+                index=exp_token_idx.view(-1, 1).repeat(1, x.shape[-1]), 
+                src=expert_out
+            )
+        # 最终输出 (batch_size * seq_len, hidden_size)
         return expert_cache
 
 
