@@ -42,20 +42,29 @@ def train_epoch(epoch, wandb):
     loss_fct = nn.CrossEntropyLoss(reduction='none')
     start_time = time.time()
     for step, (X, Y, loss_mask) in enumerate(train_loader):
+        # X, Y, loss_mask 都是形状为 (batch_size, seq_len) 的张量
+        # 其中seq_len = max_seq_len - 1
         X = X.to(args.device)
         Y = Y.to(args.device)
         loss_mask = loss_mask.to(args.device)
 
-        lr = get_lr(epoch * iter_per_epoch + step, args.epochs * iter_per_epoch, args.learning_rate)
+        lr = get_lr(
+            epoch * iter_per_epoch + step, # 当前训练步数，全局step
+            args.epochs * iter_per_epoch, # 总训练步数
+            args.learning_rate # 初始学习率
+        )
+        # 更新优化器中的学习率
         for param_group in optimizer.param_groups:
             param_group['lr'] = lr
 
-        # with ctx: 启用自动混合精度
+        # with ctx: 启用自动混合精度，提高训练速度，降低显存占用
         # 对数值精度不敏感的操作，如矩阵乘法，使用float16加速计算并减少显存占用
         # 对数值精度敏感的操作，如softmax，使用float32计算
         ctx = torch.amp.autocast(device_type='cuda', dtype=torch.float16)
         with ctx:
             # 前向传播
+            # res.logits 是模型的输出，形状为 (batch_size, seq_len, vocab_size)
+            # 包含了每个位置上每个token的预测分数（logits）
             res = model(X)
             loss = loss_fct(
                 # 将原始logits（size为[batch_size, seq_len, vocab_size]）
@@ -65,9 +74,9 @@ def train_epoch(epoch, wandb):
                 # 转换为1D张量[batch_size*(seq_len)]，用于计算损失
                 Y.view(-1)
             ).view(Y.size()) # 将损失转换为[batch_size, seq_len]的张量，与loss_mask对齐
-            # 应用损失掩码，将padding位置的损失设为0
+            # 应用attention mask，将padding位置的损失设为0
             loss = (loss * loss_mask).sum() / loss_mask.sum()
-            # 加上辅助损失
+            # 加上模型可能返回的辅助损失
             loss += res.aux_loss
             # 平均累积的梯度
             # 在进行accumulation_steps次反向传播后，才进行一次优化器更新
@@ -221,6 +230,10 @@ if __name__ == "__main__":
     train_ds = PretrainDataset(args.data_path, tokenizer, max_length=args.max_seq_len)
     # 如果是分布式训练，需要为数据集添加分布式采样器
     train_sampler = DistributedSampler(train_ds) if ddp else None
+    # train_loader中每个item的格式为
+    # [X: torch.Tensor(batch_size, max_seq_len-1), 
+    #  Y: torch.Tensor(batch_size, max_seq_len-1), 
+    #  loss_mask: torch.Tensor(batch_size, max_seq_len-1)]
     train_loader = DataLoader(
         train_ds,
         batch_size=args.batch_size,

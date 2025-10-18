@@ -180,6 +180,10 @@ if __name__ == "__main__":
 
     train_ds = SFTDataset(args.data_path, tokenizer, max_length=args.max_seq_len)
     train_sampler = DistributedSampler(train_ds) if ddp else None
+    # train_loader中每个item的格式为
+    # [X: torch.Tensor(batch_size, max_seq_len-1), 
+    #  Y: torch.Tensor(batch_size, max_seq_len-1), 
+    #  loss_mask: torch.Tensor(batch_size, max_seq_len-1)]
     train_loader = DataLoader(
         train_ds,
         batch_size=args.batch_size,

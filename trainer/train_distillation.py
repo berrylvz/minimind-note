@@ -32,22 +32,38 @@ def get_lr(current_step, total_steps, lr):
 
 
 def distillation_loss_fn(student_logits, teacher_logits, temperature=1.0, reduction='batchmean'):
+    """
+    计算学生模型与教师模型之间的蒸馏损失（KL散度）。
+
+    参数:
+        student_logits: 学生模型的输出logits，形状为 (batch_size, seq_len, vocab_size)
+        teacher_logits: 教师模型的输出logits，形状为 (batch_size, seq_len, vocab_size)
+        temperature: 温度参数，用于软化分布
+        reduction: 损失 reduction 方式，默认 'batchmean'
+
+    返回:
+        蒸馏损失值
+    """
+    # 计算教师概率分布 soft targets
     with torch.no_grad():
         teacher_probs = F.softmax(teacher_logits / temperature, hidden_size=-1).detach()
-
+    # 计算学生的 log softmax
     student_log_probs = F.log_softmax(student_logits / temperature, hidden_size=-1)
-
+    # 计算 KL 散度
     kl = F.kl_div(
-        student_log_probs,
-        teacher_probs,
-        reduction=reduction
+        student_log_probs, # input log probs from student model
+        teacher_probs, # target probs from teacher model
+        reduction=reduction # batchmean: KL总和 / batch_size
     )
+    # 温度缩放补偿
+    # logits除以了temperature，梯度变小了，所以需要乘以temperature的平方来保持梯度scale一致
     return (temperature ** 2) * kl
 
 
 def train_epoch(epoch, wandb, alpha=0.0, temperature=1.0):
     start_time = time.time()
 
+    # 冻结教师模型参数，不参与梯度计算
     if teacher_model is not None:
         teacher_model.eval()
         teacher_model.requires_grad_(False)
@@ -65,13 +81,16 @@ def train_epoch(epoch, wandb, alpha=0.0, temperature=1.0):
         # 前向传播（学生模型）
         with ctx:
             res = model(X)
+            # (batch_size, seq_len, vocab_size)
             student_logits = res.logits
 
         # 教师模型前向传播（只在eval & no_grad）
         if teacher_model is not None:
             with torch.no_grad():
+                # (batch_size, seq_len, vocab_size_teacher)
                 teacher_logits = teacher_model(X).logits
-                vocab_size_student = student_logits.size(-1)  # N
+                vocab_size_student = student_logits.size(-1)
+                # 截断教师logits到与学生模型相同的vocab size
                 teacher_logits = teacher_logits[..., :vocab_size_student]
 
         # ========== 计算损失 ==========
@@ -91,6 +110,7 @@ def train_epoch(epoch, wandb, alpha=0.0, temperature=1.0):
         if teacher_model is not None:
             # 只在有效token位置做蒸馏
             distill_loss = distillation_loss_fn(
+                # (num_valid_tokens, vocab_size)
                 student_logits.view(-1, student_logits.size(-1))[loss_mask_flat == 1],
                 teacher_logits.view(-1, teacher_logits.size(-1))[loss_mask_flat == 1],
                 temperature=temperature

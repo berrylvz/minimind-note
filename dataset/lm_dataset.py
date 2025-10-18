@@ -50,13 +50,15 @@ class PretrainDataset(Dataset):
         # encoding.input_ids 是一个形状为 (1, max_length) 的张量，包含了输入文本的 token ID 序列
         # 调用 squeeze 方法将其转换为形状为 (max_length,) 的1D张量
         input_ids = encoding.input_ids.squeeze()
+        # attention mask: pad的位置不参与loss计算
         # loss_mask 是一个形状为 (max_length,) 的布尔张量，用于指示哪些位置的 token 用于计算损失
         # 即，loss_mask 为 True 的位置对应于非填充 token，用于计算损失
         # 而 loss_mask 为 False 的位置对应于填充 token，不用于计算损失
         loss_mask = (input_ids != self.tokenizer.pad_token_id)
-
+        # 语言模型是自回归的，使用前一个token预测下一个token
         X = torch.tensor(input_ids[:-1], dtype=torch.long)
         Y = torch.tensor(input_ids[1:], dtype=torch.long)
+        # 预测结果model(X)与真实标签Y对齐，只计算non-padding token的loss
         loss_mask = torch.tensor(loss_mask[1:], dtype=torch.long)
         return X, Y, loss_mask
 
@@ -76,7 +78,11 @@ class SFTDataset(Dataset):
         #     ]
         # }
         self.samples = self.load_data(jsonl_path)
+        # 对照model/tokenizer.json
+        # [1, 1078, 538, 501]， [1]是<|im_start|>这个特殊token的id，[1078, 538, 501]是assistant的分词id
+        # 1078: "ass"; 538: "ist"; 501: "ant"
         self.bos_id = tokenizer('<|im_start|>assistant', add_special_tokens=False).input_ids
+        # [2]
         self.eos_id = tokenizer('<|im_end|>', add_special_tokens=False).input_ids
 
     def __len__(self):
@@ -93,15 +99,9 @@ class SFTDataset(Dataset):
     def _create_chat_prompt(self, conversations):
         """
             构建符合ChatML格式的对话
+            Chat Markup Language
             ChatML格式为：
-            <|im_start|>user
-            你好<|im_end|>
-            <|im_start|>assistant
-            你好！<|im_end|>
-            <|im_start|>user
-            再见<|im_end|>
-            <|im_start|>assistant
-            再见！<|im_end|>
+            "<|im_start|>user\n你好<|im_end|>\n<|im_start|>assistant\n你好！<|im_end|>"
         """
         messages = []
         for i, turn in enumerate(conversations):
@@ -109,25 +109,34 @@ class SFTDataset(Dataset):
             messages.append({"role": role, "content": turn['content']})
         return self.tokenizer.apply_chat_template(
             messages,
-            tokenize=False,
+            tokenize=False, # 不将prompt tokenize
             add_generation_prompt=False
         )
 
     def _generate_loss_mask(self, input_ids):
+        """
+        生成动态损失掩码，仅对assistant响应位置计算loss
+        1. 找到assistant角色回复内容的起始位置
+        2. 从起始位置开始，找到第一个eos_id的位置，确定assistant角色回复内容的结束位置
+        3. 对assistant角色回复内容的每个token (<|im_start|>assistant 和 <|im_end|> 之间)，设置loss_mask为1
+        """
         loss_mask = [0] * len(input_ids)
         i = 0
         while i < len(input_ids):
             # 找到assistant角色回复内容的起始位置
+            # 即找到<|im_start|>assistant的位置
             if input_ids[i:i + len(self.bos_id)] == self.bos_id:
-                # assistant 角色回复内容的起始位置
+                # assistant 角色回复**内容**的起始位置
                 start = i + len(self.bos_id)
                 # 从start位置开始，找到第一个eos_id的位置，确定assistant角色回复内容的结束位置
                 end = start
                 while end < len(input_ids):
+                    # 找到<|im_end|>的位置，确定assistant角色回复内容的结束位置
                     if input_ids[end:end + len(self.eos_id)] == self.eos_id:
                         break
                     end += 1
                 # 对assistant角色回复内容的每个token，设置loss_mask为1
+                # 自回归模型，因此从start + 1开始，到end + len(self.eos_id)结束
                 for j in range(start + 1, min(end + len(self.eos_id) + 1, self.max_length)):
                     loss_mask[j] = 1
                 i = end + len(self.eos_id) if end < len(input_ids) else len(input_ids)
@@ -137,13 +146,14 @@ class SFTDataset(Dataset):
 
     def __getitem__(self, index):
         sample = self.samples[index]
-        # 构建对话提示
+        # 构建 ChatML 格式prompt
         prompt = self._create_chat_prompt(sample['conversations'])
+        # 对prompt进行tokenize, 并截断到最大长度
         input_ids = self.tokenizer(prompt).input_ids[:self.max_length]
-        # 填充到最大长度
+        # 对于不满足最大长度的prompt，填充到最大长度
         input_ids += [self.tokenizer.pad_token_id] * (self.max_length - len(input_ids))
 
-        # 生成动态损失掩码
+        # 生成动态损失掩码，仅对assistant响应位置计算loss
         loss_mask = self._generate_loss_mask(input_ids)
 
         # 构建训练数据
@@ -187,13 +197,16 @@ class DPODataset(Dataset):
         item = self.data[index]
         chosen = item['chosen']  # 是一个 list，里面包含若干 {role, content}
         rejected = item['rejected']  # 同上
+
+        # 拼接为字符串
         chosen_prompt = self.tokenizer.apply_chat_template(
             chosen, tokenize=False, add_generation_prompt=False
         )
-
         rejected_prompt = self.tokenizer.apply_chat_template(
             rejected, tokenize=False, add_generation_prompt=False
         )
+
+        # tokenize (截断 + 填充)
         chosen_encoding = self.tokenizer(
             chosen_prompt, truncation=True, max_length=self.max_length, padding='max_length'
         )
@@ -201,12 +214,15 @@ class DPODataset(Dataset):
             rejected_prompt, truncation=True, max_length=self.max_length, padding='max_length'
         )
 
+        # 从encoding中提取input_ids
         chosen_input_ids = chosen_encoding['input_ids']
-        chosen_loss_mask = self._generate_loss_mask(chosen_input_ids)
-
         rejected_input_ids = rejected_encoding['input_ids']
+
+        # 生成动态损失掩码，仅对assistant响应内容计算loss
+        chosen_loss_mask = self._generate_loss_mask(chosen_input_ids)
         rejected_loss_mask = self._generate_loss_mask(rejected_input_ids)
 
+        # 构建训练数据
         x_chosen = torch.tensor(chosen_input_ids[:-1], dtype=torch.long)
         y_chosen = torch.tensor(chosen_input_ids[1:], dtype=torch.long)
         mask_chosen = torch.tensor(chosen_loss_mask[1:], dtype=torch.long)

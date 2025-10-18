@@ -36,12 +36,14 @@ def train_epoch(epoch, wandb):
     end_of_think_ids = tokenizer('</think>').input_ids
     start_of_answer_ids = tokenizer('<answer>').input_ids
     end_of_answer_ids = tokenizer('</answer>').input_ids
+
     loss_fct = nn.CrossEntropyLoss(reduction='none')
     start_time = time.time()
     for step, (X, Y, loss_mask) in enumerate(train_loader):
         X = X.to(args.device)
         Y = Y.to(args.device)
         loss_mask = loss_mask.to(args.device)
+
         lr = get_lr(epoch * iter_per_epoch + step, args.epochs * iter_per_epoch, args.learning_rate)
         for param_group in optimizer.param_groups:
             param_group['lr'] = lr
@@ -52,16 +54,24 @@ def train_epoch(epoch, wandb):
                 res.logits.view(-1, res.logits.size(-1)),
                 Y.view(-1)
             ).view(Y.size())
-            # 创建一个布尔掩码 sp_ids，标记出标签 Y 中所有对应于“思考”和“答案”开始/结束标记的位置
-            sp_ids = torch.isin(Y.view(-1),
-                                torch.tensor(start_of_think_ids + end_of_think_ids
-                                             + start_of_answer_ids + end_of_answer_ids
-                                             ).to(args.device))
-            # 在 sp_ids 对应的位置增加额外的惩罚
+
+            # 识别出特殊 token 所在的位置，用于增强 loss 权重
+            sp_ids = torch.isin(
+                Y.view(-1), 
+                torch.tensor(
+                    start_of_think_ids + 
+                    end_of_think_ids + 
+                    start_of_answer_ids + 
+                    end_of_answer_ids
+                ).to(args.device)
+            )
+
+            # 增强特殊 token 的 loss 惩罚权重
             loss_mask = loss_mask.view(-1)
             loss_mask_sum = loss_mask.sum()
-            loss_mask[sp_ids] = 10 # 惩罚系数
+            loss_mask[sp_ids] = 10 # 提升特殊 token loss 权重为 10
             loss_mask = loss_mask.view(Y.size())
+            
             loss = (loss * loss_mask).sum() / loss_mask_sum
             loss += res.aux_loss
             loss = loss / args.accumulation_steps

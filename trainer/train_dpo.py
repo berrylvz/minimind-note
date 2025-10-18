@@ -35,11 +35,15 @@ def logits_to_probs(logits, labels):
     将 logits 转换为概率分布
     对于一个批次的序列数据，计算模型在每个时间步对“真实下一个 token”的预测所对应的对数概率，
     并返回一个与序列形状相同的张量
+    logits shape: (batch_size, seq_len, vocab_size)
+    labels shape: (batch_size, seq_len)
+    probs shape: (batch_size, seq_len)
     """
-    # logits shape: (batch_size, seq_len, vocab_size)
-    # labels shape: (batch_size, seq_len)
-    # probs shape: (batch_size, seq_len)
+    # 计算每个token的log-softmax概率
     log_probs = F.log_softmax(logits, dim=2)
+    # 收集labels对应的log-softmax概率
+    # labels.unsqueeze(2) shape: (batch_size, seq_len, 1)
+    # torch.gather(..., dim=2): 从log_probs的第3维 (vocab_size) 中选择对应labels的log-softmax概率
     probs = torch.gather(log_probs, dim=2, index=labels.unsqueeze(2)).squeeze(-1)
     return probs
 
@@ -47,7 +51,11 @@ def logits_to_probs(logits, labels):
 def dpo_loss(ref_probs, probs, mask, beta):
     # ref_probs 和 probs 都是 shape: (batch_size, seq_len)
     # https://github.com/jingyaogong/minimind/issues/298
+
+    # 计算每个序列的有效长度（不包括 padding）
     seq_lengths = mask.sum(dim=1, keepdim=True)  # (batch_size, 1)
+
+    # 对每个样本计算平均 log prob， 排除 padding
     ref_probs = (ref_probs * mask).sum(dim=1) / seq_lengths.squeeze()
     probs = (probs * mask).sum(dim=1) / seq_lengths.squeeze()
 
@@ -58,11 +66,14 @@ def dpo_loss(ref_probs, probs, mask, beta):
     chosen_probs = probs[:batch_size // 2]
     reject_probs = probs[batch_size // 2:]
 
+    # log-ratio 比较
     pi_logratios = chosen_probs - reject_probs
     ref_logratios = chosen_ref_probs - reject_ref_probs
+
+    # 计算 DPO loss
     logits = pi_logratios - ref_logratios
     loss = -F.logsigmoid(beta * logits)
-    return loss.mean()
+    return loss.mean() # 相当于期望损失E
 
 
 def train_epoch(epoch, wandb):
@@ -70,10 +81,15 @@ def train_epoch(epoch, wandb):
     for step, batch in enumerate(train_loader):
         x_chosen = batch['x_chosen'].to(args.device)
         x_rejected = batch['x_rejected'].to(args.device)
+
         y_chosen = batch['y_chosen'].to(args.device)
         y_rejected = batch['y_rejected'].to(args.device)
+
         mask_chosen = batch['mask_chosen'].to(args.device)
         mask_rejected = batch['mask_rejected'].to(args.device)
+
+        # 合并 chosen 和 rejected 数据
+        # (2 * batch_size, seq_len)
         x = torch.cat([x_chosen, x_rejected], dim=0)
         y = torch.cat([y_chosen, y_rejected], dim=0)
         mask = torch.cat([mask_chosen, mask_rejected], dim=0)
@@ -83,15 +99,21 @@ def train_epoch(epoch, wandb):
             param_group['lr'] = lr
 
         with ctx:
+            # 冻结参考模型的参数
             with torch.no_grad():
                 ref_outputs = ref_model(x)
+                # (2 * batch_size, seq_len, vocab_size)
                 ref_logits = ref_outputs.logits
+            # 参考模型的 log prob，对应labels的概率
             ref_probs = logits_to_probs(ref_logits, y)
             ref_probs = ref_probs * mask
+
+            # 当前模型
             outputs = model(x)
             logits = outputs.logits
             probs = logits_to_probs(logits, y)
             probs = probs * mask
+            
             loss = dpo_loss(ref_probs, probs, mask, beta=0.1)
             loss = loss / args.accumulation_steps
 
@@ -146,6 +168,7 @@ def init_model(lm_config):
     # 初始化参考模型
     ref_model = MiniMindForCausalLM(lm_config)
     ref_model.load_state_dict(state_dict, strict=False)
+    # 冻结参考模型的参数
     ref_model.eval()
     ref_model.requires_grad_(False)
 
