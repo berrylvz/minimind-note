@@ -259,7 +259,7 @@ class Attention(nn.Module):
         # shape of xk: batch_size, seq_len, num_key_value_heads, head_dim
         xq, xk = apply_rotary_pos_emb(xq, xk, cos[:seq_len], sin[:seq_len])
 
-        # kv_cache实现
+        # kv cache
         if past_key_value is not None:
             xk = torch.cat([past_key_value[0], xk], dim=1)
             xv = torch.cat([past_key_value[1], xv], dim=1)
@@ -276,7 +276,7 @@ class Attention(nn.Module):
             # shape of xv: batch_size, num_attention_heads, seq_len, head_dim
             repeat_kv(xv, self.n_rep).transpose(1, 2)
         )
-
+        # use flash attention, faster and more memory-efficient
         if self.flash and seq_len != 1:
             # probability of dropping out
             dropout_p = self.dropout if self.training else 0.0
@@ -289,30 +289,45 @@ class Attention(nn.Module):
                 attn_mask = attn_mask.bool() if attention_mask is not None else None
             # use scaled_dot_product_attention to compute the attention output
             # shape of output: batch_size, num_attention_heads, seq_len, head_dim, same as xv
-            # TODO: how to use attn_mask in flash attention
+            # in-built causal mask
             output = F.scaled_dot_product_attention(xq, xk, xv, attn_mask=attn_mask, dropout_p=dropout_p, is_causal=True)
+        # normal attention
         else:
-            # TODO
+            # attention scores
+            # shape of xq: batch_size, num_attention_heads, seq_len, head_dim
+            # shape of xk: batch_size, num_attention_heads, seq_len, head_dim
+            # shape of scores: batch_size, num_attention_heads, seq_len, seq_len
             scores = (xq @ xk.transpose(-2, -1)) / math.sqrt(self.head_dim)
+
+            # causal mask
+            # add upper triangular mask to scores
+            # upper triangular of scores is -inf, to mask future tokens
             scores = scores + torch.triu(
                 torch.full((seq_len, seq_len), float("-inf"), device=scores.device),
                 diagonal=1
             ).unsqueeze(0).unsqueeze(0)  # scores+mask
 
+            # padding mask
             if attention_mask is not None:
+                # shape of attention_mask: batch_size, seq_len
+                # shape of extended_attention_mask: batch_size, 1, 1, seq_len
                 extended_attention_mask = attention_mask.unsqueeze(1).unsqueeze(2)
+                # 0 in attention_mask means padding token, set the score to -inf
                 extended_attention_mask = (1.0 - extended_attention_mask) * -1e9
                 scores = scores + extended_attention_mask
-
+            # softmax + dropout
             scores = F.softmax(scores.float(), dim=-1).type_as(xq)
             scores = self.attn_dropout(scores)
+            # shape of scores: batch_size, num_attention_heads, seq_len, seq_len
+            # shape of xv: batch_size, num_attention_heads, seq_len, head_dim
+            # shape of output: batch_size, num_attention_heads, seq_len, head_dim
             output = scores @ xv
         
         # reshape to match the shape required by the model
         # original shape of output: batch_size, num_attention_heads, seq_len, head_dim
         # shape of output: batch_size, seq_len, num_attention_heads * head_dim (=hidden_size)
         output = output.transpose(1, 2).reshape(bsz, seq_len, -1)
-        # project the output tensor to the hidden size
+        # project the output tensor to the hidden size and apply dropout
         # shape of output: batch_size, seq_len, hidden_size
         output = self.resid_dropout(self.o_proj(output))
         return output, past_kv
@@ -450,11 +465,14 @@ class MOEFeedForward(nn.Module):
     def __init__(self, config: MiniMindConfig):
         super().__init__()
         self.config = config
+        # router expert
         self.experts = nn.ModuleList([
             FeedForward(config)
             for _ in range(config.n_routed_experts)
         ])
+        # gate network
         self.gate = MoEGate(config)
+        # shared expert
         if config.n_shared_experts > 0:
             self.shared_experts = nn.ModuleList([
                 FeedForward(config)
@@ -467,9 +485,13 @@ class MOEFeedForward(nn.Module):
         bsz, seq_len, _ = x.shape
         # 使用门控机制选择专家
         topk_idx, topk_weight, aux_loss = self.gate(x)
+        # batch_size * seq_len, hidden_size
         x = x.view(-1, x.shape[-1])
+        # 为每个专家重复输入，根据topk_idx
+        # (batch_size * seq_len * top_k)
         flat_topk_idx = topk_idx.view(-1)
         if self.training:
+            # TODO
             x = x.repeat_interleave(self.config.num_experts_per_tok, dim=0)
             y = torch.empty_like(x, dtype=torch.float16)
             for i, expert in enumerate(self.experts):
